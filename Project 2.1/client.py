@@ -61,26 +61,56 @@ def rsa_decrypt(ciphertext, key):
         )
     )    
 
-with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as alice_sock, \
-     socket.socket(socket.AF_INET, socket.SOCK_STREAM) as bob_sock  :
+def getResponse(sock, request, aes_seesion_key, initial_vector):
 
+    sock.connect(bob_addr)
+
+    # send 'hello' to Bob
+    sendmsg(sock, "hello")
+
+    # receive Bob's public key
+    key = recvmsg(sock)
+    server_public_key = serialization.load_pem_public_key(
+        key, backend=default_backend()
+    )
+
+    # use Bob's public key to encrypt AES Session Key and Initial Vector 
+    encoded_aes_seesion_key = rsa_encode(aes_seesion_key, server_public_key)
+    encoded_initial_vector = rsa_encode(initial_vector, server_public_key)
+
+    # send encrypted AES Session Key and Initial Vector 
+    sendmsg(sock, encoded_aes_seesion_key)
+    sendmsg(sock, encoded_initial_vector)
+
+    # create AES encryptor and decryptor
+    cipher = Cipher(algorithms.AES(aes_seesion_key), modes.CBC(initial_vector), backend=default_backend())
+    aes_encryptor = cipher.encryptor()
+    aes_decryptor = cipher.decryptor()
+
+    # send encrypted request
+    request_msg = aes_encryptor.update(request) + aes_encryptor.finalize()
+    sendmsg(sock, request_msg)
+
+    # receive Bob's encrypted response
+    encrypted_response = recvmsg(sock)
+
+    # receive "bye" from Bob
+    recvmsg(sock)
+
+    return encrypted_response
+
+with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as alice_sock, \
+     socket.socket(socket.AF_INET, socket.SOCK_STREAM) as bob_sock_sniff, \
+     socket.socket(socket.AF_INET, socket.SOCK_STREAM) as bob_sock_forge:
+
+    # connect to Alice
     alice_sock.connect(alice_addr)
-    bob_sock.connect(bob_addr)
 
     # send student ID to Alice
     sendmsg(alice_sock, STUID)
 
     # receive "hello" from Alice
     recvmsg(alice_sock)
-
-    # send 'hello' to Bob
-    sendmsg(bob_sock, "hello")
-
-    # receive Bob's public key
-    msg = recvmsg(bob_sock)
-    server_public_key = serialization.load_pem_public_key(
-        msg, backend=default_backend()
-    )
 
     # generate my public key and private key
     my_private_key = rsa.generate_private_key(
@@ -101,51 +131,37 @@ with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as alice_sock, \
     aes_seesion_key = rsa_decrypt(recvmsg(alice_sock), my_private_key)
     initial_vector = rsa_decrypt(recvmsg(alice_sock), my_private_key)
 
-    # create AES cipher
+    # create AES decryptor
     cipher = Cipher(algorithms.AES(aes_seesion_key), modes.CBC(initial_vector), backend=default_backend())
+    aes_decryptor = cipher.decryptor()
 
     # receive Alice's encrypted message and use Aes Session Key to decrypt
-    aes_decryptor = cipher.decryptor()
     alice_request = aes_decryptor.update(recvmsg(alice_sock)) + aes_decryptor.finalize()
 
-    print("Alice request:\n\n", alice_request.decode('utf-8'))
-
     # strip null terminator
-    d = json.loads(alice_request.decode('utf-8')[:-1])
+    d = json.loads(alice_request.decode('utf-8').strip('\0'))
 
     # modify the request
     d['Account_ID'] = STUID
     d['Authentication_Code'] = hashlib.sha256(STUID.encode('utf-8')).hexdigest()
     my_request = (my_padding(json.dumps(d))).encode('utf-8')
 
-    # use server's public key to encrypt AES Session Key and Initial Vector 
-    encoded_aes_seesion_key = rsa_encode(aes_seesion_key, server_public_key)
-    encoded_initial_vector = rsa_encode(initial_vector, server_public_key)
+    encrypted_response_to_alice = getResponse(bob_sock_sniff, alice_request, aes_seesion_key, initial_vector)
+    encrypted_response_to_me = getResponse(bob_sock_forge, my_request, aes_seesion_key, initial_vector)
 
-    # send encrypted AES Session Key and Initial Vector 
-    sendmsg(bob_sock, encoded_aes_seesion_key)
-    sendmsg(bob_sock, encoded_initial_vector)
-
-    # send encrypted message
-    aes_encryptor = cipher.encryptor()
-    request_msg = aes_encryptor.update(my_request) + aes_encryptor.finalize()
-    sendmsg(bob_sock, request_msg)
-
-    # receive Bob's encrypted message and use Aes Session Key to decrypt
-    encrypted_bob_response = recvmsg(bob_sock)
-    aes_decryptor = cipher.decryptor()
-    bob_response = aes_decryptor.update(encrypted_bob_response) + aes_decryptor.finalize()
-
-    print("\nBob response:\n\n", bob_response.decode('utf-8'))
-
-    # receive "bye" from Bob
-    recvmsg(bob_sock)
-
-    # send encrypted message
-    sendmsg(alice_sock, encrypted_bob_response)
+    # send encrypted response to Alice
+    sendmsg(alice_sock, encrypted_response_to_alice)
 
     # send 'bye' to Alice
     sendmsg(alice_sock, "bye")
 
+    # decrypt message and print account money
+    aes_decryptor = cipher.decryptor()
+    response_to_alice = aes_decryptor.update(encrypted_response_to_alice) + aes_decryptor.finalize()
+    d = json.loads(response_to_alice.decode('utf-8').strip('\0'))
+    print("Alice money:", d["Account_Money"])
 
-
+    aes_decryptor = cipher.decryptor()
+    response_to_me = aes_decryptor.update(encrypted_response_to_me) + aes_decryptor.finalize()
+    d = json.loads(response_to_me.decode('utf-8').strip('\0'))
+    print("My money:", d["Account_Money"])
