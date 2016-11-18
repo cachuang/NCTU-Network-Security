@@ -11,15 +11,25 @@ from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 from cryptography import x509
 from cryptography.x509.oid import NameOID
 
-import hashlib
-import json
-
 CA_ADDR = ("140.113.194.88", 20000)
 GAME_DOWNLOADER_ADDR = ("140.113.194.88", 20500)
 STUID = "0556518"
 BLOCK_SIZE = 16
 
 my_padding = lambda s: s + (BLOCK_SIZE * int(len(s) / BLOCK_SIZE + 1) - len(s) % BLOCK_SIZE) * '\0'
+
+# recv exactly n bytes
+def recvall(sock, n):
+
+    data = b''
+
+    while len(data) < n:
+        packet = sock.recv(n - len(data))
+        if not packet:
+            return None
+        data += packet
+
+    return data
 
 # send size of message and message to destination
 def sendmsg(sock, message):
@@ -37,8 +47,7 @@ def sendmsg(sock, message):
 def recvmsg(sock):
 
     msg_size = struct.unpack("i", sock.recv(4))
-    print(int(msg_size[0]))
-    return sock.recv(int(msg_size[0]))
+    return recvall(sock, int(msg_size[0]))
 
 def rsa_decrypt(ciphertext, key):
 
@@ -71,19 +80,18 @@ with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as ca_sock, \
     )
     my_public_key = my_private_key.public_key()
 
+    # generate certificate signing request
     csr = x509.CertificateSigningRequestBuilder().subject_name(x509.Name([
-        x509.NameAttribute(NameOID.COMMON_NAME, u'0556518')
+        x509.NameAttribute(NameOID.COMMON_NAME, STUID)
     ])).sign(
         my_private_key, hashes.SHA256(), default_backend()
     )
 
-    # send csr to Alice
+    # send CSR to CA in pem foramat
     sendmsg(ca_sock, csr.public_bytes(serialization.Encoding.PEM))
 
-    # receive cert from CA
+    # receive certificate from CA
     cert_pem = recvmsg(ca_sock)
-    # cert = x509.load_pem_x509_certificate(cert_pem, default_backend())
-    # print(cert)
 
     # receive bye from CA
     recvmsg(ca_sock)
@@ -97,7 +105,7 @@ with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as ca_sock, \
     # receive "hello" from GameDownloader
     recvmsg(game_downloader_sock)
 
-    # send cert_pem to GameDownloader
+    # send certificate to GameDownloader in pem format
     sendmsg(game_downloader_sock, cert_pem)
 
     # receive "PASS" from GameDownloader
@@ -112,11 +120,13 @@ with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as ca_sock, \
     aes_decryptor = cipher.decryptor()
 
     # receive Game Binary and use Aes Session Key to decrypt
-    game_bin = recvmsg(game_downloader_sock)
-    game = aes_decryptor.update(game_bin) + aes_decryptor.finalize()
+    encrypted_game = recvmsg(game_downloader_sock)
+    game = aes_decryptor.update(encrypted_game) + aes_decryptor.finalize()
 
     with open("game", "wb") as f:
         f.write(game)
+
+    print('Download Complete. File named "game" is in the current working directory')
 
     # send "bye" to GameDownloader
     sendmsg(game_downloader_sock, "bye")
